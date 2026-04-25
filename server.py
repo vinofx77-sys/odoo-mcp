@@ -268,6 +268,33 @@ class ListModelsInput(BaseModel):
     offset: Optional[int] = Field(default=0, ge=0)
 
 
+class DigestGetInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    digest_id: int = Field(..., ge=1, description="ID of the digest.digest record")
+
+
+class DigestSendInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    digest_id: int = Field(..., ge=1, description="ID of the digest.digest record to send immediately")
+
+
+class DigestUpdateInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    digest_id: int = Field(..., ge=1, description="ID of the digest.digest record to update")
+    periodicity: Optional[str] = Field(
+        default=None,
+        description="Sending frequency: 'daily', 'weekly', or 'monthly'",
+    )
+    state: Optional[str] = Field(
+        default=None,
+        description="Digest state: 'activated' or 'deactivated'",
+    )
+    next_run_date: Optional[str] = Field(
+        default=None,
+        description="Override next scheduled run date (ISO format YYYY-MM-DD)",
+    )
+
+
 # ── Tools (identical to local version) ───────────────────────────────────────
 
 @mcp.tool(name="odoo_search_read", annotations={"readOnlyHint": True})
@@ -424,6 +451,88 @@ async def odoo_list_models(params: ListModelsInput) -> str:
         records = await _session.call_kw("ir.model", "search_read", [domain], {"fields": ["model", "name"], "limit": params.limit, "offset": params.offset, "order": "model asc"})
         total = await _session.call_kw("ir.model", "search_count", [domain], {})
         return json.dumps({"total": total, "count": len(records), "models": records, "has_more": total > params.offset + len(records)}, indent=2)
+    except Exception as e:
+        return _handle_error(e)
+
+
+_DIGEST_FIELDS = [
+    "id", "name", "periodicity", "state", "next_run_date",
+    "user_ids", "company_id",
+    "kpi_mail_message_total", "kpi_res_users_connected",
+    "kpi_account_total_revenue", "kpi_crm_lead_created",
+    "kpi_crm_opportunities_won",
+]
+
+
+@mcp.tool(name="odoo_digest_list", annotations={"readOnlyHint": True})
+async def odoo_digest_list() -> str:
+    """List all configured Odoo digests with their schedule and activation state."""
+    err = _ensure_auth()
+    if err:
+        return err
+    try:
+        records = await _session.call_kw(
+            "digest.digest", "search_read", [[]],
+            {"fields": ["id", "name", "periodicity", "state", "next_run_date", "company_id"], "order": "id asc"},
+        )
+        return json.dumps({"count": len(records), "digests": records}, indent=2, default=str)
+    except Exception as e:
+        return _handle_error(e)
+
+
+@mcp.tool(name="odoo_digest_get", annotations={"readOnlyHint": True})
+async def odoo_digest_get(params: DigestGetInput) -> str:
+    """Get full details and KPI values for a specific Odoo digest."""
+    err = _ensure_auth()
+    if err:
+        return err
+    try:
+        records = await _session.call_kw(
+            "digest.digest", "read", [[params.digest_id]],
+            {"fields": _DIGEST_FIELDS},
+        )
+        if not records:
+            return f"Error: Digest id={params.digest_id} not found."
+        return json.dumps(records[0], indent=2, default=str)
+    except Exception as e:
+        return _handle_error(e)
+
+
+@mcp.tool(name="odoo_digest_send")
+async def odoo_digest_send(params: DigestSendInput) -> str:
+    """Immediately send an Odoo digest email to its configured recipients."""
+    err = _ensure_auth()
+    if err:
+        return err
+    try:
+        await _session.call_kw("digest.digest", "action_send", [[params.digest_id]], {})
+        return json.dumps({"digest_id": params.digest_id, "status": "sent"}, indent=2)
+    except Exception as e:
+        return _handle_error(e)
+
+
+@mcp.tool(name="odoo_digest_update")
+async def odoo_digest_update(params: DigestUpdateInput) -> str:
+    """Update an Odoo digest's periodicity, activation state, or next run date."""
+    err = _ensure_auth()
+    if err:
+        return err
+    vals: Dict[str, Any] = {}
+    if params.periodicity is not None:
+        if params.periodicity not in ("daily", "weekly", "monthly"):
+            return "Error: periodicity must be 'daily', 'weekly', or 'monthly'."
+        vals["periodicity"] = params.periodicity
+    if params.state is not None:
+        if params.state not in ("activated", "deactivated"):
+            return "Error: state must be 'activated' or 'deactivated'."
+        vals["state"] = params.state
+    if params.next_run_date is not None:
+        vals["next_run_date"] = params.next_run_date
+    if not vals:
+        return "Error: Provide at least one field to update (periodicity, state, or next_run_date)."
+    try:
+        result = await _session.call_kw("digest.digest", "write", [[params.digest_id], vals], {})
+        return json.dumps({"digest_id": params.digest_id, "updated_fields": list(vals.keys()), "success": result}, indent=2)
     except Exception as e:
         return _handle_error(e)
 
