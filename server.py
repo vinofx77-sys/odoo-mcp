@@ -450,24 +450,12 @@ if __name__ == "__main__":
     if not MCP_SECRET:
         print("WARNING: MCP_SECRET not set — server is open to anyone", file=sys.stderr)
 
-    # Expose both SSE (/sse) and streamable-http (/mcp) transports
-    # Claude Code remote MCP uses /sse; streamable-http clients use /mcp
-    from starlette.applications import Starlette
-    from starlette.routing import Mount
-
-    sse_app = mcp.sse_app()
-    http_app = mcp.streamable_http_app()
-
-    combined = Starlette(
-        routes=[
-            Mount("/mcp", app=http_app),
-            Mount("/", app=sse_app),
-        ]
-    )
-    combined.add_middleware(BearerAuthMiddleware)
-
+    # Streamable-HTTP transport — endpoint: POST /mcp
+    # Claude Code: claude mcp add --transport http odoo-cloud https://<host>/mcp
+    starlette_app = mcp.streamable_http_app()
+    starlette_app.add_middleware(BearerAuthMiddleware)
     uvicorn.run(
-        combined,
+        starlette_app,
         host=HOST,
         port=PORT,
         log_level="info",
