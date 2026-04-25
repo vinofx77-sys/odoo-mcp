@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional
 import httpx
 import uvicorn
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import BaseModel, Field, ConfigDict, field_validator
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
@@ -98,7 +99,12 @@ async def app_lifespan(app):
     await _session.close()
 
 
-mcp = FastMCP("odoo_mcp", lifespan=app_lifespan)
+mcp = FastMCP(
+    "odoo_mcp",
+    lifespan=app_lifespan,
+    # Disable DNS rebinding protection — we use Bearer token auth instead
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+)
 
 
 def _ensure_auth() -> str:
