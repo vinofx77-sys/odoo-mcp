@@ -428,6 +428,9 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         if not MCP_SECRET:
             return await call_next(request)
+        # Allow health check without auth
+        if request.url.path == "/health":
+            return await call_next(request)
         auth = request.headers.get("Authorization", "")
         if not auth.startswith("Bearer ") or auth[7:] != MCP_SECRET:
             return Response("Unauthorized", status_code=401)
@@ -437,9 +440,19 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    starlette_app = mcp.sse_app()
-    starlette_app.add_middleware(BearerAuthMiddleware)
-    print(f"Starting Odoo MCP SSE server on {HOST}:{PORT}", file=sys.stderr)
+    print(f"Starting Odoo MCP server on {HOST}:{PORT}", file=sys.stderr)
     if not MCP_SECRET:
         print("WARNING: MCP_SECRET not set — server is open to anyone", file=sys.stderr)
-    uvicorn.run(starlette_app, host=HOST, port=PORT, log_level="info")
+
+    # Use streamable-http transport (works behind reverse proxies like Render/Cloudflare)
+    # Endpoint: POST /mcp  (Claude Code remote MCP)
+    starlette_app = mcp.streamable_http_app()
+    starlette_app.add_middleware(BearerAuthMiddleware)
+    uvicorn.run(
+        starlette_app,
+        host=HOST,
+        port=PORT,
+        log_level="info",
+        forwarded_allow_ips="*",
+        proxy_headers=True,
+    )
