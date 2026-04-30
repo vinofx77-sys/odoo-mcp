@@ -11,6 +11,7 @@ import json
 import os
 import sys
 from contextlib import asynccontextmanager
+from datetime import date, timedelta
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -268,6 +269,16 @@ class ListModelsInput(BaseModel):
     offset: Optional[int] = Field(default=0, ge=0)
 
 
+class WeeklyDigestInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    week_offset: int = Field(
+        default=0,
+        ge=-52,
+        le=0,
+        description="0 = current week, -1 = last week, etc.",
+    )
+
+
 # ── Tools (identical to local version) ───────────────────────────────────────
 
 @mcp.tool(name="odoo_search_read", annotations={"readOnlyHint": True})
@@ -426,6 +437,141 @@ async def odoo_list_models(params: ListModelsInput) -> str:
         return json.dumps({"total": total, "count": len(records), "models": records, "has_more": total > params.offset + len(records)}, indent=2)
     except Exception as e:
         return _handle_error(e)
+
+
+@mcp.tool(name="odoo_weekly_digest", annotations={"readOnlyHint": True})
+async def odoo_weekly_digest(params: WeeklyDigestInput) -> str:
+    """Return a business digest for a given ISO week (Mon–Sun).
+
+    Covers: confirmed sales orders, draft/posted invoices, new customers,
+    purchase orders, CRM opportunities, and overdue activities.
+    """
+    err = _ensure_auth()
+    if err:
+        return err
+
+    today = date.today() + timedelta(weeks=params.week_offset)
+    week_start = today - timedelta(days=today.weekday())  # Monday
+    week_end = week_start + timedelta(days=6)             # Sunday
+    week_start_str = week_start.isoformat()
+    week_end_str = week_end.isoformat()
+
+    # Helper: date range domain clause
+    def date_domain(field: str) -> list:
+        return [[field, ">=", week_start_str], [field, "<=", week_end_str]]
+
+    async def safe_count(model: str, domain: list) -> int:
+        try:
+            return await _session.call_kw(model, "search_count", [domain], {})
+        except Exception:
+            return -1
+
+    async def safe_sum(model: str, domain: list, field: str) -> float:
+        try:
+            records = await _session.call_kw(
+                model, "search_read", [domain], {"fields": [field]}
+            )
+            return sum(r.get(field) or 0 for r in records)
+        except Exception:
+            return 0.0
+
+    async def safe_read(model: str, domain: list, fields: list, limit: int = 10, order: str = "") -> list:
+        try:
+            kw: Dict[str, Any] = {"fields": fields, "limit": limit}
+            if order:
+                kw["order"] = order
+            return await _session.call_kw(model, "search_read", [domain], kw)
+        except Exception:
+            return []
+
+    # ── Sales ─────────────────────────────────────────────────────────────────
+    sale_domain = [["state", "in", ["sale", "done"]]] + date_domain("date_order")
+    sale_count = await safe_count("sale.order", sale_domain)
+    sale_amount = await safe_sum("sale.order", sale_domain, "amount_untaxed")
+    sale_records = await safe_read(
+        "sale.order", sale_domain,
+        ["name", "partner_id", "amount_untaxed", "currency_id", "date_order"],
+        limit=5, order="amount_untaxed desc",
+    )
+
+    # ── Invoices ──────────────────────────────────────────────────────────────
+    inv_domain = [["move_type", "=", "out_invoice"]] + date_domain("invoice_date")
+    inv_posted_domain = inv_domain + [["state", "=", "posted"]]
+    inv_draft_domain = inv_domain + [["state", "=", "draft"]]
+    inv_posted_count = await safe_count("account.move", inv_posted_domain)
+    inv_draft_count = await safe_count("account.move", inv_draft_domain)
+    inv_posted_amount = await safe_sum("account.move", inv_posted_domain, "amount_untaxed")
+    inv_records = await safe_read(
+        "account.move", inv_posted_domain,
+        ["name", "partner_id", "amount_total", "currency_id", "invoice_date"],
+        limit=5, order="amount_total desc",
+    )
+
+    # ── Purchase orders ───────────────────────────────────────────────────────
+    po_domain = [["state", "in", ["purchase", "done"]]] + date_domain("date_approve")
+    po_count = await safe_count("purchase.order", po_domain)
+    po_amount = await safe_sum("purchase.order", po_domain, "amount_untaxed")
+
+    # ── New customers ─────────────────────────────────────────────────────────
+    customer_domain = [["customer_rank", ">", 0]] + date_domain("create_date")
+    customer_count = await safe_count("res.partner", customer_domain)
+    customer_records = await safe_read(
+        "res.partner", customer_domain,
+        ["name", "email", "phone", "create_date"],
+        limit=5, order="create_date desc",
+    )
+
+    # ── CRM opportunities ─────────────────────────────────────────────────────
+    crm_new_domain = [["type", "=", "opportunity"]] + date_domain("create_date")
+    crm_won_domain = [["type", "=", "opportunity"], ["stage_id.is_won", "=", True]] + date_domain("date_closed")
+    crm_new_count = await safe_count("crm.lead", crm_new_domain)
+    crm_won_count = await safe_count("crm.lead", crm_won_domain)
+    crm_won_amount = await safe_sum("crm.lead", crm_won_domain, "expected_revenue")
+
+    # ── Overdue activities ────────────────────────────────────────────────────
+    overdue_domain = [["date_deadline", "<", week_start_str], ["active", "=", True]]
+    overdue_count = await safe_count("mail.activity", overdue_domain)
+
+    # ── Activities due this week ──────────────────────────────────────────────
+    due_this_week_domain = date_domain("date_deadline") + [["active", "=", True]]
+    due_this_week_count = await safe_count("mail.activity", due_this_week_domain)
+
+    digest = {
+        "week": {
+            "start": week_start_str,
+            "end": week_end_str,
+            "label": f"W{week_start.isocalendar()[1]} {week_start.year}",
+        },
+        "sales": {
+            "confirmed_orders": sale_count,
+            "total_amount_untaxed": round(sale_amount, 2),
+            "top_orders": sale_records,
+        },
+        "invoicing": {
+            "posted_invoices": inv_posted_count,
+            "draft_invoices": inv_draft_count,
+            "posted_amount_untaxed": round(inv_posted_amount, 2),
+            "top_invoices": inv_records,
+        },
+        "purchasing": {
+            "confirmed_orders": po_count,
+            "total_amount_untaxed": round(po_amount, 2),
+        },
+        "customers": {
+            "new_this_week": customer_count,
+            "recent": customer_records,
+        },
+        "crm": {
+            "new_opportunities": crm_new_count,
+            "won_this_week": crm_won_count,
+            "won_revenue": round(crm_won_amount, 2),
+        },
+        "activities": {
+            "overdue": overdue_count,
+            "due_this_week": due_this_week_count,
+        },
+    }
+    return json.dumps(digest, indent=2, default=str)
 
 
 # ── Auth middleware ───────────────────────────────────────────────────────────
